@@ -69,7 +69,29 @@ s3 = boto3.client("s3", region_name=AWS_REGION)
 # while encrypted files still need to be recovered.
 # --------------------------------------------------
 
+
+import base64
+
 def get_encryption_key():
+    # Production: read the original key from Render environment variables.
+    encoded_key = os.environ.get("ENCRYPTION_KEY_B64")
+
+    if encoded_key:
+        try:
+            key = base64.b64decode(encoded_key, validate=True)
+        except Exception as exc:
+            raise RuntimeError(
+                "ENCRYPTION_KEY_B64 must be valid Base64."
+            ) from exc
+
+        if len(key) != 32:
+            raise RuntimeError(
+                "Encryption key must be exactly 32 bytes."
+            )
+
+        return key
+
+    # Local development: use the existing key file.
     if KEY_FILE.exists():
         key = KEY_FILE.read_bytes()
 
@@ -80,18 +102,12 @@ def get_encryption_key():
 
         return key
 
-    key = AESGCM.generate_key(bit_length=256)
+    # Do not silently generate a new key.
+    raise RuntimeError(
+        "Encryption key is missing. Configure ENCRYPTION_KEY_B64 "
+        "or restore the original encryption.key file."
+    )
 
-    try:
-        with KEY_FILE.open("xb") as key_file:
-            key_file.write(key)
-    except FileExistsError:
-        key = KEY_FILE.read_bytes()
-
-    if len(key) != 32:
-        raise RuntimeError("Invalid encryption key.")
-
-    return key
 
 
 # --------------------------------------------------
