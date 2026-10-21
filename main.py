@@ -38,27 +38,25 @@ MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
 BLOCK_COUNT = 4
 
 # Your CloudFront website domain
+
+from fastapi.middleware.cors import CORSMiddleware
+
 FRONTEND_ORIGINS = [
-    "https://d2fqq2pjertec.cloudfront.net",
+    "https://d2fqq2prjertec.cloudfront.net",
     "http://localhost:5500",
     "http://127.0.0.1:5500",
     "http://localhost:5501",
     "http://127.0.0.1:5501",
 ]
 
-app = FastAPI(
-    title="Secure Cloud File Storage API",
-    version="1.2.0",
-    description="AES-GCM encrypted file storage using Amazon S3",
-)
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=FRONTEND_ORIGINS,
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 s3 = boto3.client("s3", region_name=AWS_REGION)
 
