@@ -2,24 +2,27 @@
 import os
 import json
 import uuid
+import base64
 import hashlib
+import logging
+
 from pathlib import Path
 from io import BytesIO
 from datetime import datetime, timezone
 
 import boto3
 from botocore.exceptions import ClientError
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
-
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from fastapi.responses import StreamingResponse
 
 
-# --------------------------------------------------
+# ==================================================
 # CONFIGURATION
-# --------------------------------------------------
+# ==================================================
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -37,9 +40,25 @@ AWS_REGION = "ap-south-1"
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
 BLOCK_COUNT = 4
 
-# Your CloudFront website domain
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-from fastapi.middleware.cors import CORSMiddleware
+
+# ==================================================
+# FASTAPI APPLICATION
+# Define app BEFORE configuring middleware.
+# ==================================================
+
+app = FastAPI(
+    title="Secure Cloud File Storage API",
+    version="1.3.0",
+    description="Secure file storage using AES-256-GCM and Amazon S3",
+)
+
+
+# ==================================================
+# CORS CONFIGURATION
+# ==================================================
 
 FRONTEND_ORIGINS = [
     "https://d2fqq2prjertec.cloudfront.net",
@@ -53,30 +72,39 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=FRONTEND_ORIGINS,
     allow_credentials=False,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
 
-s3 = boto3.client("s3", region_name=AWS_REGION)
+# ==================================================
+# AWS S3 CLIENT
+# Credentials are read from the environment or
+# the configured AWS credentials provider.
+# ==================================================
+
+s3 = boto3.client(
+    "s3",
+    region_name=AWS_REGION,
+)
 
 
-# --------------------------------------------------
+# ==================================================
 # ENCRYPTION KEY
-# IMPORTANT: Never delete or regenerate this file
-# while encrypted files still need to be recovered.
-# --------------------------------------------------
-
-
-import base64
+# IMPORTANT:
+# Keep the same key to decrypt previously stored files.
+# Configure ENCRYPTION_KEY_B64 in Render.
+# ==================================================
 
 def get_encryption_key():
-    # Production: read the original key from Render environment variables.
     encoded_key = os.environ.get("ENCRYPTION_KEY_B64")
 
     if encoded_key:
         try:
-            key = base64.b64decode(encoded_key, validate=True)
+            key = base64.b64decode(
+                encoded_key,
+                validate=True,
+            )
         except Exception as exc:
             raise RuntimeError(
                 "ENCRYPTION_KEY_B64 must be valid Base64."
@@ -84,12 +112,12 @@ def get_encryption_key():
 
         if len(key) != 32:
             raise RuntimeError(
-                "Encryption key must be exactly 32 bytes."
+                "The encryption key must be exactly 32 bytes."
             )
 
         return key
 
-    # Local development: use the existing key file.
+    # Local development fallback: use the existing key.
     if KEY_FILE.exists():
         key = KEY_FILE.read_bytes()
 
@@ -100,17 +128,16 @@ def get_encryption_key():
 
         return key
 
-    # Do not silently generate a new key.
+    # Do not silently generate a replacement key.
     raise RuntimeError(
         "Encryption key is missing. Configure ENCRYPTION_KEY_B64 "
-        "or restore the original encryption.key file."
+        "in Render or restore the original encryption.key file."
     )
 
 
-
-# --------------------------------------------------
-# HELPERS
-# --------------------------------------------------
+# ==================================================
+# HELPER FUNCTIONS
+# ==================================================
 
 def is_valid_file_id(file_id: str) -> bool:
     try:
@@ -124,7 +151,10 @@ def get_s3_json(key: str):
         Bucket=BUCKET_NAME,
         Key=key,
     )
-    return json.loads(response["Body"].read().decode("utf-8"))
+
+    return json.loads(
+        response["Body"].read().decode("utf-8")
+    )
 
 
 def save_manifest(file_id: str, manifest: dict):
@@ -146,25 +176,32 @@ def save_manifest(file_id: str, manifest: dict):
 
 def load_manifest(file_id: str):
     try:
-        return get_s3_json(f"metadata/{file_id}.json")
+        return get_s3_json(
+            f"metadata/{file_id}.json"
+        )
+
     except ClientError as exc:
-        code = exc.response.get("Error", {}).get("Code", "")
+        code = exc.response.get(
+            "Error", {}
+        ).get("Code", "")
 
         if code in ("NoSuchKey", "404", "NotFound"):
             raise HTTPException(
                 status_code=404,
                 detail="File not found in cloud storage.",
-            )
+            ) from exc
+
+        logger.exception("Could not retrieve file metadata")
 
         raise HTTPException(
             status_code=502,
             detail="Could not retrieve file metadata from S3.",
-        )
+        ) from exc
 
 
-# --------------------------------------------------
-# HEALTH CHECK
-# --------------------------------------------------
+# ==================================================
+# HOME AND HEALTH CHECK
+# ==================================================
 
 @app.get("/")
 def root():
@@ -179,18 +216,22 @@ def health():
     return {
         "status": "ok",
         "service": "Secure Cloud File Storage API",
+        "storage": "Amazon S3",
+        "region": AWS_REGION,
     }
 
 
-# --------------------------------------------------
-# UPLOAD AND ENCRYPT
-# --------------------------------------------------
+# ==================================================
+# UPLOAD, SPLIT, ENCRYPT AND STORE
+# ==================================================
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
-    original_name = Path(file.filename or "uploaded_file").name
+    original_name = Path(
+        file.filename or "uploaded_file"
+    ).name
 
-    if not original_name:
+    if original_name in ("", ".", ".."):
         raise HTTPException(
             status_code=400,
             detail="A valid filename is required.",
@@ -211,42 +252,47 @@ async def upload_file(file: UploadFile = File(...)):
         )
 
     file_id = str(uuid.uuid4())
-    key = get_encryption_key()
-    aes = AESGCM(key)
-
-    # Split data into up to four non-empty blocks.
-    number_of_blocks = min(BLOCK_COUNT, len(data))
-    block_size = (
-        len(data) + number_of_blocks - 1
-    ) // number_of_blocks
-
-    block_entries = []
 
     try:
+        key = get_encryption_key()
+        aes = AESGCM(key)
+
+        # Split the original data into up to four blocks.
+        number_of_blocks = min(
+            BLOCK_COUNT,
+            len(data),
+        )
+
+        block_size = (
+            len(data) + number_of_blocks - 1
+        ) // number_of_blocks
+
+        block_entries = []
+
         for index, start in enumerate(
             range(0, len(data), block_size)
         ):
             plaintext = data[start:start + block_size]
             nonce = os.urandom(12)
 
-            # AES-GCM returns ciphertext followed by its authentication tag.
-            encrypted = aes.encrypt(nonce, plaintext, None)
-
-            block_key = (
-                f"encrypted_blocks/{file_id}/block_{index}.bin"
+            # AES-GCM encrypts and authenticates each block.
+            encrypted = aes.encrypt(
+                nonce,
+                plaintext,
+                None,
             )
 
-            # Keep a local development copy.
-            local_file = (
-                BLOCKS_DIR / file_id / f"block_{index}.bin"
+            s3_key = (
+                f"encrypted_blocks/{file_id}/"
+                f"block_{index}.bin"
             )
-            local_file.parent.mkdir(parents=True, exist_ok=True)
-            local_file.write_bytes(encrypted)
 
+            # Upload encrypted data to S3.
             s3.put_object(
                 Bucket=BUCKET_NAME,
-                Key=block_key,
+                Key=s3_key,
                 Body=encrypted,
+                ContentType="application/octet-stream",
                 ServerSideEncryption="AES256",
                 Metadata={
                     "file-id": file_id,
@@ -254,9 +300,10 @@ async def upload_file(file: UploadFile = File(...)):
                 },
             )
 
+            # Record the information needed to decrypt the block.
             block_entries.append({
                 "index": index,
-                "s3_key": block_key,
+                "s3_key": s3_key,
                 "nonce": nonce.hex(),
                 "size": len(plaintext),
                 "sha256": hashlib.sha256(
@@ -277,11 +324,34 @@ async def upload_file(file: UploadFile = File(...)):
             "blocks": block_entries,
         }
 
-        # Save metadata after all blocks have uploaded.
+        # Save file metadata in S3.
         save_manifest(file_id, manifest)
 
-        # Keep an optional local original for development.
-        (INPUT_DIR / f"{file_id}_{original_name}").write_bytes(data)
+        # Save local copies for development only.
+        local_original = (
+            INPUT_DIR / f"{file_id}_{original_name}"
+        )
+        local_original.write_bytes(data)
+
+        for entry in block_entries:
+            response = s3.get_object(
+                Bucket=BUCKET_NAME,
+                Key=entry["s3_key"],
+            )
+
+            encrypted_block = response["Body"].read()
+
+            local_block = (
+                BLOCKS_DIR
+                / file_id
+                / f"block_{entry['index']}.bin"
+            )
+
+            local_block.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+            local_block.write_bytes(encrypted_block)
 
         return {
             "message": "File encrypted and uploaded successfully.",
@@ -294,27 +364,34 @@ async def upload_file(file: UploadFile = File(...)):
 
     except HTTPException:
         raise
-    except Exception:
-        # Log full details in the backend terminal, not to the browser.
-        import logging
-        logging.exception("Upload failed for file_id=%s", file_id)
+
+    except Exception as exc:
+        logger.exception(
+            "Upload failed for file_id=%s",
+            file_id,
+        )
 
         raise HTTPException(
             status_code=500,
             detail="Upload failed. Check the backend logs.",
-        )
+        ) from exc
+
+    finally:
+        await file.close()
 
 
-# --------------------------------------------------
+# ==================================================
 # LIST STORED FILES
-# --------------------------------------------------
+# ==================================================
 
 @app.get("/files")
 def list_files():
     files = []
 
     try:
-        paginator = s3.get_paginator("list_objects_v2")
+        paginator = s3.get_paginator(
+            "list_objects_v2"
+        )
 
         for page in paginator.paginate(
             Bucket=BUCKET_NAME,
@@ -322,7 +399,9 @@ def list_files():
         ):
             for item in page.get("Contents", []):
                 object_key = item["Key"]
-                filename = object_key.rsplit("/", 1)[-1]
+                filename = object_key.rsplit(
+                    "/", 1
+                )[-1]
 
                 if not filename.endswith(".json"):
                     continue
@@ -350,10 +429,9 @@ def list_files():
                     })
 
                 except Exception:
-                    # Skip unreadable metadata and continue listing.
-                    import logging
-                    logging.exception(
-                        "Could not read metadata: %s", object_key
+                    logger.exception(
+                        "Could not read metadata: %s",
+                        object_key,
                     )
 
         files.sort(
@@ -366,19 +444,18 @@ def list_files():
             "files": files,
         }
 
-    except ClientError:
-        import logging
-        logging.exception("S3 listing failed")
+    except ClientError as exc:
+        logger.exception("S3 file listing failed")
 
         raise HTTPException(
             status_code=502,
             detail="Could not list files from S3.",
-        )
+        ) from exc
 
 
-# --------------------------------------------------
-# DOWNLOAD AND DECRYPT
-# --------------------------------------------------
+# ==================================================
+# DOWNLOAD, DECRYPT AND VERIFY
+# ==================================================
 
 @app.get("/download/{file_id}")
 def download_file(file_id: str):
@@ -390,6 +467,12 @@ def download_file(file_id: str):
 
     manifest = load_manifest(file_id)
 
+    if manifest.get("file_id") != file_id:
+        raise HTTPException(
+            status_code=422,
+            detail="File metadata does not match the requested ID.",
+        )
+
     try:
         aes = AESGCM(get_encryption_key())
         plaintext_blocks = []
@@ -399,40 +482,56 @@ def download_file(file_id: str):
             key=lambda block: block["index"],
         )
 
-        if not blocks:
+        if not blocks or len(blocks) > BLOCK_COUNT:
             raise HTTPException(
                 status_code=422,
-                detail="File metadata contains no blocks.",
+                detail="Invalid block information in file metadata.",
             )
 
         for block in blocks:
+            s3_key = block.get("s3_key", "")
+            expected_prefix = (
+                f"encrypted_blocks/{file_id}/"
+            )
+
+            if not s3_key.startswith(expected_prefix):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Invalid block storage path.",
+                )
+
             response = s3.get_object(
                 Bucket=BUCKET_NAME,
-                Key=block["s3_key"],
+                Key=s3_key,
             )
-            encrypted = response["Body"].read()
 
+            encrypted = response["Body"].read()
             nonce = bytes.fromhex(block["nonce"])
 
-            # Authentication failure means ciphertext or key is wrong.
+            if len(nonce) != 12:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Invalid encryption nonce.",
+                )
+
+            # Decrypt and authenticate the block.
             plaintext = aes.decrypt(
                 nonce,
                 encrypted,
                 None,
             )
 
-            expected_hash = block.get("sha256")
             actual_hash = hashlib.sha256(
                 plaintext
             ).hexdigest()
 
-            if expected_hash and actual_hash != expected_hash:
+            if actual_hash != block.get("sha256"):
                 raise HTTPException(
                     status_code=422,
-                    detail="File integrity check failed.",
+                    detail="File block integrity check failed.",
                 )
 
-            if len(plaintext) != block["size"]:
+            if len(plaintext) != block.get("size"):
                 raise HTTPException(
                     status_code=422,
                     detail="File block size verification failed.",
@@ -440,6 +539,7 @@ def download_file(file_id: str):
 
             plaintext_blocks.append(plaintext)
 
+        # Reconstruct the original file in block order.
         original_data = b"".join(plaintext_blocks)
 
         if len(original_data) != manifest.get("size"):
@@ -478,22 +578,39 @@ def download_file(file_id: str):
 
     except HTTPException:
         raise
-    except ClientError:
-        import logging
-        logging.exception("S3 download failed for %s", file_id)
 
-        raise HTTPException(
-            status_code=502,
-            detail="Could not retrieve encrypted file from S3.",
+    except InvalidTag as exc:
+        logger.exception(
+            "AES-GCM authentication failed for %s",
+            file_id,
         )
-    except Exception:
-        import logging
-        logging.exception("Decryption failed for %s", file_id)
 
         raise HTTPException(
             status_code=422,
             detail=(
-                "Decryption failed. Check that the original "
-                "encryption.key file is available."
+                "Decryption failed. The encryption key or "
+                "encrypted data may not match."
             ),
+        ) from exc
+
+    except ClientError as exc:
+        logger.exception(
+            "S3 download failed for %s",
+            file_id,
         )
+
+        raise HTTPException(
+            status_code=502,
+            detail="Could not retrieve the encrypted file from S3.",
+        ) from exc
+
+    except Exception as exc:
+        logger.exception(
+            "Download or decryption failed for %s",
+            file_id,
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Download failed. Check the backend logs.",
+        ) from exc
