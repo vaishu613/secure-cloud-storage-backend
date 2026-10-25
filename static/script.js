@@ -1,6 +1,8 @@
-// Use a relative base URL so API calls always go to the same host that served this page.
-// This works for local development (FastAPI on :8000) and any deployment automatically.
-const API_BASE_URL = "";
+// ⚠️ REPLACE the Render URL below with your actual Render service URL.
+// Find it at: https://dashboard.render.com → your service → the ".onrender.com" URL shown at the top.
+const API_BASE_URL = window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1"
+    ? "http://127.0.0.1:8000"                                     // local dev
+    : "https://secure-cloud-storage-backend-ky43.onrender.com";                   // ← replace this!
 
 const loginForm = document.getElementById("loginForm");
 const signupForm = document.getElementById("signupForm");
