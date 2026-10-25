@@ -1,6 +1,6 @@
-const API_BASE_URL = window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1"
-    ? "http://127.0.0.1:8000"
-    : "https://secure-cloud-storage-backend.onrender.com"; // Adjust if deployed
+// Use a relative base URL so API calls always go to the same host that served this page.
+// This works for local development (FastAPI on :8000) and any deployment automatically.
+const API_BASE_URL = "";
 
 const loginForm = document.getElementById("loginForm");
 const signupForm = document.getElementById("signupForm");
