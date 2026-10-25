@@ -3,3 +3,5 @@ uvicorn[standard]
 boto3
 cryptography
 python-multipart
+PyJWT
+python-dotenv
